@@ -7,16 +7,17 @@ from collections import OrderedDict
 import numpy as np
 import torch
 import torch.optim as optim
+from tqdm import tqdm
 from evaluation.metrics import calculate_metrics
 from neural_methods.loss.NegPearsonLoss import Neg_Pearson
 from neural_methods.model.TS_CAN import TSCAN
 from neural_methods.trainer.BaseTrainer import BaseTrainer
-from tqdm import tqdm
+from neural_methods.trainer.helpers import compute_hr_from_spectrum_peak_det
 
 
 class TscanTrainer(BaseTrainer):
 
-    def __init__(self, config, data_loader):
+    def __init__(self, config, data_loader, valid_metric, steps_per_epoch=None):
         """Inits parameters from args and the writer for TensorboardX."""
         super().__init__()
         self.device = torch.device(config.DEVICE)
@@ -31,12 +32,16 @@ class TscanTrainer(BaseTrainer):
         self.config = config 
         self.min_valid_loss = None
         self.best_epoch = 0
+        self.valid_metric = valid_metric
+        self.steps_per_epoch = steps_per_epoch
 
         if config.TOOLBOX_MODE == "train_and_test":
             self.model = TSCAN(frame_depth=self.frame_depth, img_size=config.TRAIN.DATA.PREPROCESS.RESIZE.H).to(self.device)
             self.model = torch.nn.DataParallel(self.model, device_ids=list(range(config.NUM_OF_GPU_TRAIN)))
 
             self.num_train_batches = len(data_loader["train"])
+            if self.steps_per_epoch is not None:
+                self.num_train_batches = self.steps_per_epoch
             self.criterion = torch.nn.MSELoss()
             self.optimizer = optim.AdamW(
                 self.model.parameters(), lr=config.TRAIN.LR, weight_decay=0)
@@ -63,7 +68,11 @@ class TscanTrainer(BaseTrainer):
             train_loss = []
             self.model.train()
             # Model Training
-            tbar = tqdm(data_loader["train"], ncols=80)
+            if self.steps_per_epoch is not None:
+                tbar = tqdm(data_loader["train"],
+                            ncols=80, total=self.steps_per_epoch)
+            else:
+                tbar = tqdm(data_loader["train"], ncols=80)
             for idx, batch in enumerate(tbar):
                 tbar.set_description("Train epoch %s" % epoch)
                 data, labels = batch[0].to(
@@ -90,6 +99,9 @@ class TscanTrainer(BaseTrainer):
                     running_loss = 0.0
                 train_loss.append(loss.item())
                 tbar.set_postfix(loss=loss.item())
+
+                if idx == self.steps_per_epoch-1:
+                    break
 
             # Append the mean training loss for the epoch
             mean_training_losses.append(np.mean(train_loss))
@@ -129,17 +141,32 @@ class TscanTrainer(BaseTrainer):
                 data_valid, labels_valid = valid_batch[0].to(
                     self.device), valid_batch[1].to(self.device)
                 N, D, C, H, W = data_valid.shape
-                data_valid = data_valid.view(N * D, C, H, W)
-                labels_valid = labels_valid.view(-1, 1)
-                data_valid = data_valid[:(N * D) // self.base_len * self.base_len]
-                labels_valid = labels_valid[:(N * D) // self.base_len * self.base_len]
-                pred_ppg_valid = self.model(data_valid)
-                loss = self.criterion(pred_ppg_valid, labels_valid)
-                valid_loss.append(loss.item())
+                loss_batch = []
+                for i in range(N):
+                    data_valid_i = data_valid[
+                        i, :D//self.base_len*self.base_len]
+                    labels_valid_i = labels_valid[
+                        i, :D//self.base_len*self.base_len]
+                    pred_ppg_valid = self.model(data_valid_i)
+                    if self.valid_metric == 'hr_mae':
+                        hr_pred = compute_hr_from_spectrum_peak_det(
+                            pred_ppg_valid.cpu().numpy(), 25)
+                        hr_true = compute_hr_from_spectrum_peak_det(
+                            labels_valid_i.cpu().numpy(), 25)
+                        valid_res = abs(hr_true - hr_pred)
+                    elif self.valid_metric == 'loss':
+                        valid_res = self.criterion(
+                            pred_ppg_valid, labels_valid_i).item()
+                    else:
+                        raise NotImplementedError(
+                            'This valid_metric is not implemented.')
+                    loss_batch.append(valid_res)
+                    valid_loss.append(valid_res)
+                loss_batch = np.nanmean(loss_batch)
+                vbar.set_postfix(loss=loss_batch)
                 valid_step += 1
-                vbar.set_postfix(loss=loss.item())
             valid_loss = np.asarray(valid_loss)
-        return np.mean(valid_loss)
+        return np.nanmean(valid_loss)
 
     def test(self, data_loader):
         """ Model evaluation on the testing dataset."""

@@ -41,7 +41,7 @@ class BaseLoader(Dataset):
             "--preprocess", default=None, action='store_true')
         return parser
 
-    def __init__(self, dataset_name, raw_data_path, config_data):
+    def __init__(self, dataset_name, raw_data_path, config_data, subject_list, num_workers):
         """Inits dataloader with lists of files.
 
         Args:
@@ -59,6 +59,8 @@ class BaseLoader(Dataset):
         self.data_format = config_data.DATA_FORMAT
         self.do_preprocess = config_data.DO_PREPROCESS
         self.config_data = config_data
+        self.subject_list = subject_list
+        self.multi_process_quota = num_workers
 
         assert (config_data.BEGIN < config_data.END)
         assert (config_data.BEGIN > 0 or config_data.BEGIN == 0)
@@ -210,7 +212,7 @@ class BaseLoader(Dataset):
         self.load_preprocessed_data()  # load all data and corresponding labels (sorted for consistency)
         print("Total Number of raw files preprocessed:", len(data_dirs_split), end='\n\n')
 
-    def preprocess(self, frames, bvps, config_preprocess):
+    def preprocess(self, frames, bvps, bvps_ts, config_preprocess):
         """Preprocesses a pair of data.
 
         Args:
@@ -254,15 +256,17 @@ class BaseLoader(Dataset):
             bvps = BaseLoader.standardized_label(bvps)
         else:
             raise ValueError("Unsupported label type!")
+        bvps_ts = bvps_ts[:len(bvps)]
 
         if config_preprocess.DO_CHUNK:  # chunk data into snippets
-            frames_clips, bvps_clips = self.chunk(
-                data, bvps, config_preprocess.CHUNK_LENGTH)
+            frames_clips, bvps_clips, bvps_ts_clips = self.chunk(
+                data, bvps, bvps_ts, config_preprocess.CHUNK_LENGTH)
         else:
             frames_clips = np.array([data])
             bvps_clips = np.array([bvps])
+            bvps_ts_clips = np.array([bvps_ts])
 
-        return frames_clips, bvps_clips
+        return frames_clips, bvps_clips, bvps_ts_clips
 
     def face_detection(self, frame, backend, use_larger_box=False, larger_box_coef=1.0):
         """Face detection on a single frame.
@@ -397,7 +401,7 @@ class BaseLoader(Dataset):
             resized_frames[i] = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
         return resized_frames
 
-    def chunk(self, frames, bvps, chunk_length):
+    def chunk(self, frames, bvps, bvps_ts, chunk_length):
         """Chunk the data into small chunks.
 
         Args:
@@ -412,7 +416,9 @@ class BaseLoader(Dataset):
         clip_num = frames.shape[0] // chunk_length
         frames_clips = [frames[i * chunk_length:(i + 1) * chunk_length] for i in range(clip_num)]
         bvps_clips = [bvps[i * chunk_length:(i + 1) * chunk_length] for i in range(clip_num)]
-        return np.array(frames_clips), np.array(bvps_clips)
+        bvps_ts_clips = [
+            bvps_ts[i * chunk_length:(i + 1) * chunk_length] for i in range(clip_num)]
+        return np.array(frames_clips), np.array(bvps_clips), np.array(bvps_ts_clips)
 
     def save(self, frames_clips, bvps_clips, filename):
         """Save all the chunked data.
@@ -439,7 +445,7 @@ class BaseLoader(Dataset):
             count += 1
         return count
 
-    def save_multi_process(self, frames_clips, bvps_clips, filename):
+    def save_multi_process(self, frames_clips, bvps_clips, bvps_ts_clips, filename):
         """Save all the chunked data with multi-thread processing.
 
         Args:
@@ -455,18 +461,23 @@ class BaseLoader(Dataset):
         count = 0
         input_path_name_list = []
         label_path_name_list = []
+        label_ts_path_name_list = []
         for i in range(len(bvps_clips)):
             assert (len(self.inputs) == len(self.labels))
             input_path_name = self.cached_path + os.sep + "{0}_input{1}.npy".format(filename, str(count))
             label_path_name = self.cached_path + os.sep + "{0}_label{1}.npy".format(filename, str(count))
+            label_ts_path_name = self.cached_path + os.sep + \
+                "{0}_label_ts{1}.npy".format(filename, str(count))
             input_path_name_list.append(input_path_name)
             label_path_name_list.append(label_path_name)
+            label_ts_path_name_list.append(label_ts_path_name)
             np.save(input_path_name, frames_clips[i])
             np.save(label_path_name, bvps_clips[i])
+            np.save(label_ts_path_name, bvps_ts_clips[i])
             count += 1
-        return input_path_name_list, label_path_name_list
+        return input_path_name_list, label_path_name_list, label_ts_path_name_list
 
-    def multi_process_manager(self, data_dirs, config_preprocess, multi_process_quota=8):
+    def multi_process_manager(self, data_dirs, config_preprocess):
         """Allocate dataset preprocessing across multiple processes.
 
         Args:
@@ -491,7 +502,7 @@ class BaseLoader(Dataset):
         for i in choose_range:
             process_flag = True
             while process_flag:  # ensure that every i creates a process
-                if running_num < multi_process_quota:  # in case of too many processes
+                if running_num < self.multi_process_quota:  # in case of too many processes
                     # send data to be preprocessing task
                     p = Process(target=self.preprocess_dataset_subprocess, 
                                 args=(data_dirs,config_preprocess, i, file_list_dict))
@@ -582,11 +593,23 @@ class BaseLoader(Dataset):
         file_list_df = pd.read_csv(file_list_path)
         inputs = file_list_df['input_files'].tolist()
         if not inputs:
-            raise ValueError(self.dataset_name + ' dataset loading data error!')
+            raise ValueError(self.dataset_name +
+                             ' dataset loading data error!')
+        # if there are entries in the subject_list, then only use their preprocessed data
+        if len(self.subject_list) > 0:
+            inputs_new = []
+            for subj in self.subject_list:
+                for fn in inputs:
+                    if subj in fn:
+                        inputs_new.append(fn)
+            inputs = inputs_new
         inputs = sorted(inputs)  # sort input file name list
         labels = [input_file.replace("input", "label") for input_file in inputs]
+        labels_ts = [input_file.replace("input", "label_ts")
+                     for input_file in inputs]
         self.inputs = inputs
         self.labels = labels
+        self.labels_ts = labels_ts
         self.preprocessed_data_len = len(inputs)
 
     @staticmethod

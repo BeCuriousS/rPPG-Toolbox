@@ -5,17 +5,18 @@ from collections import OrderedDict
 import numpy as np
 import torch
 import torch.optim as optim
+from tqdm import tqdm
 from evaluation.metrics import calculate_metrics
 from neural_methods.loss.PhysNetNegPearsonLoss import Neg_Pearson
 from neural_methods.model.PhysNet import PhysNet_padding_Encoder_Decoder_MAX
 from neural_methods.trainer.BaseTrainer import BaseTrainer
 from torch.autograd import Variable
-from tqdm import tqdm
+from neural_methods.trainer.helpers import compute_hr_from_spectrum_peak_det
 
 
 class PhysnetTrainer(BaseTrainer):
 
-    def __init__(self, config, data_loader):
+    def __init__(self, config, data_loader, valid_metric, steps_per_epoch=None):
         """Inits parameters from args and the writer for TensorboardX."""
         super().__init__()
         self.device = torch.device(config.DEVICE)
@@ -28,12 +29,16 @@ class PhysnetTrainer(BaseTrainer):
         self.config = config
         self.min_valid_loss = None
         self.best_epoch = 0
+        self.valid_metric = valid_metric
+        self.steps_per_epoch = steps_per_epoch
 
         self.model = PhysNet_padding_Encoder_Decoder_MAX(
             frames=config.MODEL.PHYSNET.FRAME_NUM).to(self.device)  # [3, T, 128,128]
 
         if config.TOOLBOX_MODE == "train_and_test":
             self.num_train_batches = len(data_loader["train"])
+            if self.steps_per_epoch is not None:
+                self.num_train_batches = self.steps_per_epoch
             self.loss_model = Neg_Pearson()
             self.optimizer = optim.Adam(
                 self.model.parameters(), lr=config.TRAIN.LR)
@@ -59,7 +64,11 @@ class PhysnetTrainer(BaseTrainer):
             running_loss = 0.0
             train_loss = []
             self.model.train()
-            tbar = tqdm(data_loader["train"], ncols=80)
+            if self.steps_per_epoch is not None:
+                tbar = tqdm(data_loader["train"],
+                            ncols=80, total=self.steps_per_epoch)
+            else:
+                tbar = tqdm(data_loader["train"], ncols=80)
             for idx, batch in enumerate(tbar):
                 tbar.set_description("Train epoch %s" % epoch)
                 rPPG, x_visual, x_visual3232, x_visual1616 = self.model(
@@ -68,7 +77,7 @@ class PhysnetTrainer(BaseTrainer):
                     torch.float32).to(self.device)
                 rPPG = (rPPG - torch.mean(rPPG)) / torch.std(rPPG)  # normalize
                 BVP_label = (BVP_label - torch.mean(BVP_label)) / \
-                            torch.std(BVP_label)  # normalize
+                    torch.std(BVP_label)  # normalize
                 loss = self.loss_model(rPPG, BVP_label)
                 loss.backward()
                 running_loss += loss.item()
@@ -85,6 +94,9 @@ class PhysnetTrainer(BaseTrainer):
                 self.scheduler.step()
                 self.optimizer.zero_grad()
                 tbar.set_postfix(loss=loss.item())
+
+                if idx == self.steps_per_epoch-1:
+                    break
 
             # Append the mean training loss for the epoch
             mean_training_losses.append(np.mean(train_loss))
@@ -124,17 +136,42 @@ class PhysnetTrainer(BaseTrainer):
                 vbar.set_description("Validation")
                 BVP_label = valid_batch[1].to(
                     torch.float32).to(self.device)
-                rPPG, x_visual, x_visual3232, x_visual1616 = self.model(
-                    valid_batch[0].to(torch.float32).to(self.device))
-                rPPG = (rPPG - torch.mean(rPPG)) / torch.std(rPPG)  # normalize
-                BVP_label = (BVP_label - torch.mean(BVP_label)) / \
-                            torch.std(BVP_label)  # normalize
-                loss_ecg = self.loss_model(rPPG, BVP_label)
-                valid_loss.append(loss_ecg.item())
+                loss_batch = []
+                for i in range(valid_batch[0].shape[0]):
+                    vb = valid_batch[0][i:i+1]
+                    bvpl = BVP_label[i:i+1]
+                    N, C, D, H, W = vb.shape
+                    # convert to NDCHW
+                    vb = torch.permute(vb, (0, 2, 1, 3, 4))
+                    # split CHUNK of length 610 in 10x61
+                    vb = vb.view(10, 61, C, H, W)
+                    # convert back to NCDHW
+                    vb = torch.permute(vb, (0, 2, 1, 3, 4))
+                    rPPG, x_visual, x_visual3232, x_visual1616 = self.model(
+                        vb.to(torch.float32).to(self.device))
+                    rPPG = rPPG.view(1, -1)
+                    rPPG = (rPPG - torch.mean(rPPG)) / \
+                        torch.std(rPPG)  # normalize
+                    if self.valid_metric == 'hr_mae':
+                        hr_pred = compute_hr_from_spectrum_peak_det(
+                            rPPG.cpu().numpy(), 25)
+                        hr_true = compute_hr_from_spectrum_peak_det(
+                            bvpl.cpu().numpy(), 25)
+                        valid_res = abs(hr_true - hr_pred)
+                    elif self.valid_metric == 'loss':
+                        bvpl = (bvpl - torch.mean(bvpl)) / \
+                            torch.std(bvpl)  # normalize
+                        valid_res = self.loss_model(rPPG, bvpl).item()
+                    else:
+                        raise NotImplementedError(
+                            'This valid_metric is not implemented.')
+                    loss_batch.append(valid_res)
+                    valid_loss.append(valid_res)
+                loss_batch = np.nanmean(loss_batch)
+                vbar.set_postfix(loss=loss_batch)
                 valid_step += 1
-                vbar.set_postfix(loss=loss_ecg.item())
             valid_loss = np.asarray(valid_loss)
-        return np.mean(valid_loss)
+        return np.nanmean(valid_loss)
 
     def test(self, data_loader):
         """ Runs the model on test sets."""
